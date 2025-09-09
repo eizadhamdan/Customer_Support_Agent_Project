@@ -4,6 +4,7 @@ from typing import List, Tuple, Dict
 from transformers import pipeline
 import faiss
 import textwrap
+import shutil
 
 from utils.embeddings import EmbeddingGenerator
 from utils.preprocessing import clean_text
@@ -14,7 +15,14 @@ class RAGPipeline:
     Improved Retrieval-Augmented Generation pipeline
     """
 
-    def __init__(self, embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    def __init__(self, embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2", force_download: bool = False):
+        # Set cache directory
+        self.cache_dir = "models_cache"
+        
+        # Force clear corrupted cache if requested
+        if force_download:
+            self.clear_embedding_cache(embedding_model)
+
         # Embedding model
         self.embedder = EmbeddingGenerator(model_name=embedding_model)
 
@@ -39,6 +47,36 @@ class RAGPipeline:
         #     tokenizer="microsoft/DialoGPT-medium",
         #     device=0 if os.getenv('CUDA_AVAILABLE') else -1
         # )
+
+    def clear_embedding_cache(self, model_name: str):
+        """Clear the corrupted embedding model cache."""
+        # Convert model name to cache directory format
+        cache_model_name = model_name.replace('/', '_')
+        embedding_cache_dir = os.path.join(self.cache_dir, "embeddings")
+        
+        if os.path.exists(embedding_cache_dir):
+            # Remove all directories that start with the model name
+            for item in os.listdir(embedding_cache_dir):
+                if item.startswith(cache_model_name):
+                    item_path = os.path.join(embedding_cache_dir, item)
+                    if os.path.isdir(item_path):
+                        print(f"Removing corrupted cache: {item_path}")
+                        shutil.rmtree(item_path)
+
+    def force_redownload_models(self):
+        """Force redownload of all models by clearing cache."""
+        print("Forcing model redownload...")
+        
+        # Clear embedding cache
+        embedding_cache_dir = os.path.join(self.cache_dir, "embeddings")
+        if os.path.exists(embedding_cache_dir):
+            shutil.rmtree(embedding_cache_dir)
+            print("Cleared embedding model cache")
+        
+        # Reinitialize embedder to trigger fresh download
+        model_name = getattr(self.embedder, 'model_name', 'sentence-transformers/all-MiniLM-L6-v2')
+        self.embedder = EmbeddingGenerator(model_name=model_name)
+        print("Embedding model redownloaded successfully")
 
     def build_index(self, documents: List[str], metadata: List[str] = None):
         """
@@ -199,8 +237,6 @@ Answer:"""
     
     def clear_cache(self, model_name: str = None):
         """Clear cached models."""
-        import shutil
-        
         if model_name:
             # Clear specific model
             model_cache_path = os.path.join(self.cache_dir, model_name.replace('/', '_'))
@@ -217,4 +253,3 @@ Answer:"""
                 print("Cleared all model cache")
             else:
                 print("No cache directory found")
-                

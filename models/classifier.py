@@ -13,7 +13,7 @@ class TicketClassifier:
         self.emotion_pipeline = pipeline(
             "text-classification",
             model="j-hartmann/emotion-english-distilroberta-base",
-            top_k=None,  # Changed from return_all_scores=True to top_k=None
+            top_k=None,
             truncation=True
         )
 
