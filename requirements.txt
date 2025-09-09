@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+transformers
+torch
+sentence-transformers
+chromadb
+faiss-cpu
+requests
+beautifulsoup4
+scikit-learn
+tqdm
+pytest
