@@ -1,4 +1,4 @@
-# Customer Support Copilot for Atlan
+# Customer Support Copilot
 
 A **Streamlit-based AI-powered helpdesk assistant** that classifies customer support tickets, routes them to the right teams, and answers common queries using **Retrieval-Augmented Generation (RAG)** with a **persistent Chroma vector database**.
 
