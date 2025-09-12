@@ -38,7 +38,6 @@ The project combines **NLP models** (via Hugging Face Transformers) with **vecto
    - **Bulk ticket classification** table
    - **Interactive agent** form
    - **Routed tickets log**
-   - Custom styling with Atlan branding (`#2027d3`, `#62e1fc`, `#ffffff`)
 
 ---
 
