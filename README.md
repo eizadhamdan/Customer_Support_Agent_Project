@@ -126,7 +126,7 @@ streamlit run app.py
 
 The app opens in your browser at http://localhost:8501.
 
-## 🧠 How It Works
+## How It Works
 
 ### 1. Bulk Ticket Classification
 
