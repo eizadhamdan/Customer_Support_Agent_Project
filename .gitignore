@@ -3,3 +3,8 @@
 __pycache__
 *.pyc
 .env
+kb/embedding_cache
+kb/chroma_db
+embedding_cache
+chroma_db
+models_cache

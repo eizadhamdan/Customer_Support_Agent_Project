@@ -1,255 +1,255 @@
-import os
-import numpy as np
-from typing import List, Tuple, Dict
-from transformers import pipeline
-import faiss
-import textwrap
-import shutil
-
-from utils.embeddings import EmbeddingGenerator
+import chromadb
+import re
+from typing import List, Tuple, Dict, Optional
 from utils.preprocessing import clean_text
+from utils.embeddings import EmbeddingGenerator
+from transformers import pipeline
+import numpy as np
 
 
 class RAGPipeline:
-    """
-    Improved Retrieval-Augmented Generation pipeline
-    """
+    def __init__(self, persist_dir="kb/chroma_db"):
+        self.client = chromadb.PersistentClient(path=persist_dir)
+        self.collection = self.client.get_or_create_collection("knowledge_base")
+        self.embedder = EmbeddingGenerator(model_name="sentence-transformers/all-mpnet-base-v2")
 
-    def __init__(self, embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2", force_download: bool = False):
-        # Set cache directory
-        self.cache_dir = "models_cache"
-        
-        # Force clear corrupted cache if requested
-        if force_download:
-            self.clear_embedding_cache(embedding_model)
-
-        # Embedding model
-        self.embedder = EmbeddingGenerator(model_name=embedding_model)
-
-        # Initialize FAISS index (cosine similarity via inner product)
-        self.index = None
-        self.docs = []   # text chunks
-        self.meta = []   # metadata (e.g. URLs)
-
-        # Better generative model options (choose one):
-        # Option 1: Larger T5 model
-        self.generator = pipeline(
-            "text2text-generation",
-            model="google/flan-t5-base",  # 250M params - much better
-            tokenizer="google/flan-t5-base",
-            device=0 if os.getenv('CUDA_AVAILABLE') else -1  # GPU if available
+        self.qa_pipeline = pipeline(
+            "question-answering",
+            model="deepset/roberta-base-squad2",
+            tokenizer="deepset/roberta-base-squad2"
         )
         
-        # Option 2: Use a more capable model (uncomment if you want this instead)
-        # self.generator = pipeline(
-        #     "text-generation",
-        #     model="microsoft/DialoGPT-medium",
-        #     tokenizer="microsoft/DialoGPT-medium",
-        #     device=0 if os.getenv('CUDA_AVAILABLE') else -1
-        # )
+        # Context management
+        self.max_context_length = 2000
 
-    def clear_embedding_cache(self, model_name: str):
-        """Clear the corrupted embedding model cache."""
-        # Convert model name to cache directory format
-        cache_model_name = model_name.replace('/', '_')
-        embedding_cache_dir = os.path.join(self.cache_dir, "embeddings")
+    def expand_query(self, query: str) -> str:
+        """
+        Simple query expansion to improve retrieval
+        """
+        # Add common variations and synonyms
+        query_lower = query.lower()
+        expansions = []
         
-        if os.path.exists(embedding_cache_dir):
-            # Remove all directories that start with the model name
-            for item in os.listdir(embedding_cache_dir):
-                if item.startswith(cache_model_name):
-                    item_path = os.path.join(embedding_cache_dir, item)
-                    if os.path.isdir(item_path):
-                        print(f"Removing corrupted cache: {item_path}")
-                        shutil.rmtree(item_path)
-
-    def force_redownload_models(self):
-        """Force redownload of all models by clearing cache."""
-        print("Forcing model redownload...")
+        # Add original query
+        expansions.append(query)
         
-        # Clear embedding cache
-        embedding_cache_dir = os.path.join(self.cache_dir, "embeddings")
-        if os.path.exists(embedding_cache_dir):
-            shutil.rmtree(embedding_cache_dir)
-            print("Cleared embedding model cache")
+        # Add variations for common terms
+        if "how to" in query_lower:
+            expansions.append(query.replace("how to", "steps to"))
+            expansions.append(query.replace("how to", "guide"))
         
-        # Reinitialize embedder to trigger fresh download
-        model_name = getattr(self.embedder, 'model_name', 'sentence-transformers/all-MiniLM-L6-v2')
-        self.embedder = EmbeddingGenerator(model_name=model_name)
-        print("Embedding model redownloaded successfully")
-
-    def build_index(self, documents: List[str], metadata: List[str] = None):
-        """
-        Build FAISS index from list of documents.
-        """
-        print(f"Building index for {len(documents)} documents...")
+        if "what is" in query_lower:
+            expansions.append(query.replace("what is", "definition of"))
+            expansions.append(query.replace("what is", ""))
         
-        clean_docs = [clean_text(d) for d in documents]
-        embeddings = self.embedder.encode(clean_docs, normalize=True)
-        embeddings = np.array(embeddings, dtype="float32")
+        if "error" in query_lower or "issue" in query_lower:
+            expansions.append(query + " troubleshooting")
+            expansions.append(query + " fix")
+        
+        return " ".join(expansions)
 
-        dim = embeddings.shape[1]
-        self.index = faiss.IndexFlatIP(dim)  # cosine similarity
-        self.index.add(embeddings)
-
-        self.docs = documents
-        self.meta = metadata if metadata else [""] * len(documents)
-        print(f"Index built successfully with {self.index.ntotal} documents")
-
-    def retrieve(self, query: str, top_k: int = 3) -> List[Tuple[str, str, float]]:
+    def retrieve(self, query: str, top_k: int = 5) -> List[Tuple[str, str, float]]:
         """
-        Retrieve top-k most relevant documents with scores.
+        Enhanced retrieval with query expansion and better ranking
         """
-        if self.index is None:
-            raise ValueError("Index is empty. Call build_index() first.")
-
-        q_emb = self.embedder.encode([clean_text(query)], normalize=True)
-        q_emb = np.array(q_emb, dtype="float32")
-
-        scores, indices = self.index.search(q_emb, top_k)
-        results = [(self.docs[i], self.meta[i], scores[0][j]) for j, i in enumerate(indices[0])]
-        return results
-
-    def generate_answer(self, query: str, top_k: int = 3, max_new_tokens: int = 150) -> Tuple[str, List[Dict]]:
-        """
-        Generate answer with improved prompting and error handling.
-        """
-        if self.index is None:
-            return ("Knowledge base not loaded. Please try again later.", [])
-
-        try:
-            retrieved = self.retrieve(query, top_k=top_k)
-
-            if not retrieved:
-                return ("I could not find relevant information in the knowledge base.", [])
-
-            # Filter by relevance score (optional - adjust threshold as needed)
-            filtered_docs = [(doc, meta, score) for doc, meta, score in retrieved if score > 0.3]
-            
-            if not filtered_docs:
-                return ("No sufficiently relevant information found for your question.", [])
-
-            sources = []
-            context_parts = []
-            
-            for i, (doc_text, meta, score) in enumerate(filtered_docs, start=1):
-                # Truncate documents to prevent context overflow
-                words = doc_text.strip().split()
-                excerpt = " ".join(words[:100])  # Limit to 100 words per doc
-                
-                sources.append({
-                    "id": i, 
-                    "url": meta or "unknown", 
-                    "excerpt": excerpt,
-                    "relevance_score": float(score)
-                })
-                context_parts.append(f"Source {i}: {excerpt}")
-
-            # Simplified, clearer prompt
-            context_str = "\n\n".join(context_parts)
-            
-            prompt = f"""Based on the following information, answer the question clearly and concisely.
-
-Information:
-{context_str}
-
-Question: {query}
-
-Answer:"""
-
-            # Generate with better parameters
-            gen_output = self.generator(
-                prompt,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                pad_token_id=self.generator.tokenizer.eos_token_id
-            )
-
-            # Better output parsing
-            if isinstance(gen_output, list) and len(gen_output) > 0:
-                generated_text = gen_output[0].get("generated_text", "")
+        # Expand query for better matching
+        expanded_query = self.expand_query(query)
+        
+        # Get embeddings for expanded query
+        q_emb = self.embedder.encode([clean_text(expanded_query)]).tolist()[0]
+        
+        # Retrieve more candidates initially
+        results = self.collection.query(
+            query_embeddings=[q_emb],
+            n_results=min(top_k * 2, 10)  # Get more candidates
+        )
+        
+        if not results["documents"][0]:
+            return []
+        
+        docs = results["documents"][0]
+        metas = results["metadatas"][0]
+        distances = results.get("distances", [None] * len(docs))[0]
+        
+        # Convert distances to similarity scores (lower distance = higher similarity)
+        similarities = []
+        for dist in distances:
+            if dist is not None:
+                # Convert distance to similarity (assuming cosine distance)
+                similarity = 1 - dist if dist is not None else 0.0
             else:
-                generated_text = str(gen_output)
+                similarity = 0.0
+            similarities.append(similarity)
+        
+        # Simple reranking based on query term overlap
+        reranked_results = []
+        query_terms = set(clean_text(query).lower().split())
+        
+        for doc, meta, sim in zip(docs, metas, similarities):
+            # Calculate term overlap boost
+            doc_terms = set(clean_text(doc).lower().split())
+            overlap_ratio = len(query_terms.intersection(doc_terms)) / len(query_terms) if query_terms else 0
             
-            # Clean up the response
-            if prompt in generated_text:
-                generated_text = generated_text.replace(prompt, "").strip()
+            # Boost score based on term overlap
+            boosted_score = sim + (overlap_ratio * 0.1)  # Small boost for term overlap
+            
+            reranked_results.append((doc, meta.get("source", ""), boosted_score))
+        
+        # Sort by boosted score and return top_k
+        reranked_results.sort(key=lambda x: x[2], reverse=True)
+        return reranked_results[:top_k]
+
+    def create_structured_context(self, retrieved_docs: List[Tuple[str, str, float]], query: str) -> str:
+        """
+        Create well-structured context instead of simple concatenation
+        """
+        if not retrieved_docs:
+            return ""
+        
+        context_parts = []
+        total_length = 0
+        
+        for i, (doc, source, score) in enumerate(retrieved_docs):
+            doc_clean = doc.strip()
+            
+            # Skip very short or repetitive documents
+            if len(doc_clean) < 30:
+                continue
                 
-            if not generated_text:
-                generated_text = "I apologize, but I couldn't generate a proper response based on the available information."
+            # Add document with clear separation
+            doc_header = f"Document {i+1}:"
+            if source:
+                doc_header += f" (Source: {source})"
+            
+            formatted_doc = f"{doc_header}\n{doc_clean}"
+            
+            # Check length limits
+            if total_length + len(formatted_doc) > self.max_context_length:
+                remaining_space = self.max_context_length - total_length - len(doc_header) - 10
+                if remaining_space > 100:
+                    truncated_doc = f"{doc_header}\n{doc_clean[:remaining_space]}..."
+                    context_parts.append(truncated_doc)
+                break
+            
+            context_parts.append(formatted_doc)
+            total_length += len(formatted_doc)
+        
+        return "\n\n---\n\n".join(context_parts)
+
+    def validate_answer(self, answer: str, query: str, context: str) -> Tuple[str, float]:
+        """
+        Simple answer validation and confidence estimation
+        """
+        if not answer or answer.lower().strip() in ["", "no answer found.", "no answer"]:
+            return "I couldn't find a specific answer to your question in the knowledge base.", 0.0
+        
+        # Clean up common QA model artifacts
+        answer = answer.strip()
+        
+        # Remove answers that are just repetitions of the question
+        if answer.lower() in query.lower():
+            return "I couldn't find a specific answer to your question in the knowledge base.", 0.0
+        
+        # Simple confidence based on answer length and content
+        confidence = 0.5  # Base confidence
+        
+        # Boost confidence for longer, more detailed answers
+        if len(answer) > 20:
+            confidence += 0.2
+        if len(answer) > 50:
+            confidence += 0.1
+        
+        # Reduce confidence for very short answers
+        if len(answer) < 10:
+            confidence -= 0.2
+        
+        # Check if answer seems to be from context (simple heuristic)
+        answer_words = set(answer.lower().split())
+        context_words = set(context.lower().split())
+        
+        if answer_words.intersection(context_words):
+            confidence += 0.1
+        
+        confidence = max(0.0, min(1.0, confidence))
+        
+        return answer, confidence
+
+    def generate_answer(self, query: str, top_k: int = 3) -> Tuple[str, List[Dict], float]:
+        """
+        Generate answer with retrieval and validation
+        """
+        # Retrieve documents
+        retrieved = self.retrieve(query, top_k=top_k)
+        
+        if not retrieved:
+            return "I couldn't find relevant information in the knowledge base.", [], 0.0
+        
+        # Create structured context
+        context = self.create_structured_context(retrieved, query)
+        
+        # Prepare sources
+        sources = []
+        for idx, (doc, src, score) in enumerate(retrieved):
+            doc_words = doc.split()
+            if len(doc_words) > 30:
+                excerpt = " ".join(doc_words[:30]) + "..."
+            else:
+                excerpt = doc
                 
-            return generated_text, sources
+            sources.append({
+                "id": f"doc-{idx+1}",
+                "url": src,
+                "excerpt": excerpt,
+                "relevance_score": round(float(score), 3)
+            })
+        
+        if not context.strip():
+            return "I couldn't find relevant information in the knowledge base.", sources, 0.0
+        
+        try:
+            # Generate answer
+            result = self.qa_pipeline({
+                "question": query,
+                "context": context
+            })
+            
+            raw_answer = result.get("answer", "No answer found.")
+            qa_confidence = result.get("score", 0.0)
+            
+            # Validate and clean up answer
+            final_answer, validation_confidence = self.validate_answer(raw_answer, query, context)
+            
+            # Combine confidences
+            combined_confidence = (qa_confidence + validation_confidence) / 2
+            
+            # Add confidence indicator for very uncertain answers
+            if combined_confidence < 0.3:
+                final_answer = f"Based on limited information: {final_answer}"
+            
+            return final_answer, sources, combined_confidence
             
         except Exception as e:
-            print(f"Error in generate_answer: {e}")
-            return (f"Sorry, I encountered an error while processing your question: {str(e)}", [])
-
-    def debug_retrieval(self, query: str, top_k: int = 5):
-        """
-        Debug function to see what documents are being retrieved.
-        """
-        if self.index is None:
-            print("Index not built yet.")
-            return
-            
-        retrieved = self.retrieve(query, top_k=top_k)
-        print(f"\nQuery: {query}")
-        print("=" * 50)
-        
-        for i, (doc, meta, score) in enumerate(retrieved, 1):
-            print(f"\nRank {i} (Score: {score:.3f}):")
-            print(f"Source: {meta}")
-            print(f"Content: {doc[:200]}...")
-            print("-" * 30)
+            print(f"Error in QA pipeline: {e}")
+            return f"I encountered an error while processing your question: {str(e)}", sources, 0.0
     
-    def get_cache_info(self) -> Dict:
-        """Get information about cached models."""
-        cache_info = {
-            "cache_directory": self.cache_dir,
-            "total_size_mb": 0,
-            "models": []
-        }
+    def get_similar_questions(self, query: str, top_k: int = 3) -> List[str]:
+        """
+        Find similar questions that might help users refine their query
+        """
         
-        if not os.path.exists(self.cache_dir):
-            return cache_info
-            
-        for item in os.listdir(self.cache_dir):
-            item_path = os.path.join(self.cache_dir, item)
-            if os.path.isdir(item_path):
-                # Calculate directory size
-                size = sum(
-                    os.path.getsize(os.path.join(dirpath, filename))
-                    for dirpath, dirnames, filenames in os.walk(item_path)
-                    for filename in filenames
-                ) / (1024 * 1024)  # Convert to MB
-                
-                cache_info["models"].append({
-                    "name": item.replace('_', '/'),
-                    "size_mb": round(size, 2),
-                    "path": item_path
-                })
-                cache_info["total_size_mb"] += size
+        variations = []
+        query_lower = query.lower()
         
-        cache_info["total_size_mb"] = round(cache_info["total_size_mb"], 2)
-        return cache_info
-    
-    def clear_cache(self, model_name: str = None):
-        """Clear cached models."""
-        if model_name:
-            # Clear specific model
-            model_cache_path = os.path.join(self.cache_dir, model_name.replace('/', '_'))
-            if os.path.exists(model_cache_path):
-                shutil.rmtree(model_cache_path)
-                print(f"Cleared cache for model: {model_name}")
-            else:
-                print(f"No cache found for model: {model_name}")
-        else:
-            # Clear all cache
-            if os.path.exists(self.cache_dir):
-                shutil.rmtree(self.cache_dir)
-                os.makedirs(self.cache_dir, exist_ok=True)
-                print("Cleared all model cache")
-            else:
-                print("No cache directory found")
+        if "how" in query_lower:
+            variations.append(query.replace("how", "what are the steps"))
+            variations.append(query.replace("how", "guide"))
+        
+        if "what" in query_lower:
+            variations.append(query.replace("what", "how"))
+            variations.append(query + " examples")
+        
+        if "error" in query_lower:
+            variations.append(query.replace("error", "issue"))
+            variations.append(query + " solution")
+        
+        return variations[:top_k]
